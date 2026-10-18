@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>MERCADO - Ce que fait le bot</title>
+<style>
+:root{
+  --bg:#EEF1F6; --surface:#FFFFFF; --ink:#151A3D; --muted:#566086; --line:#D9DEEA;
+  --accent:#F2B100; --on-accent:#151A3D;
+  --done:#17855A; --pending:#C42A39;
+  --tg:#2481C0; --tt:#E0245E; --site:#7A4FD0;
+  --bubble-client:#E4E8F2; --bubble-bot:#FFF3CC; --bubble-ia:#E3F4EC;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0F1330; --surface:#181D45; --ink:#EEF0FA; --muted:#9AA1CC; --line:#2A3066;
+    --accent:#F5B921; --on-accent:#151A3D;
+    --done:#4CC38A; --pending:#FF6B78;
+    --tg:#5BB4EE; --tt:#FF5C8A; --site:#A98BFF;
+    --bubble-client:#232957; --bubble-bot:#3A3416; --bubble-ia:#173A2B;
+  }
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family:"Avenir Next","Segoe UI",system-ui,-apple-system,sans-serif;
+  font-size:16px; line-height:1.45;
+}
+button{font:inherit; color:inherit; cursor:pointer}
+:focus-visible{outline:3px solid var(--accent); outline-offset:2px}
+.app{max-width:560px; margin:0 auto; padding:16px 16px 104px}
+
+/* header */
+.top{display:flex; align-items:flex-end; justify-content:space-between; gap:12px; margin-bottom:18px}
+.brand{font-size:30px; font-weight:800; letter-spacing:-0.02em; line-height:1}
+.today{color:var(--muted); font-size:14px; margin-top:4px}
+.status{font-size:13px; font-weight:600; padding:5px 10px; border-radius:999px; border:1.5px solid var(--line); background:var(--surface); white-space:nowrap}
+.status.live{border-color:var(--done); color:var(--done)}
+
+/* tasks */
+.next{background:var(--accent); color:var(--on-accent); border-radius:14px; padding:16px; margin-bottom:16px}
+.next h2{margin:0 0 2px; font-size:13px; font-weight:700}
+.next .t{font-size:21px; font-weight:800; line-height:1.2; margin:0}
+.next .d{margin:4px 0 0; font-size:15px}
+.seg{display:flex; gap:6px; margin-bottom:12px}
+.seg button{flex:1; border:1.5px solid var(--line); background:var(--surface); border-radius:10px; padding:9px 8px; font-weight:600}
+.seg button[aria-pressed="true"]{border-color:var(--ink); background:var(--ink); color:var(--bg)}
+.list{list-style:none; margin:0; padding:0; display:grid; gap:8px}
+.task{display:flex; gap:12px; align-items:flex-start; background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:12px}
+.check{flex:none; width:26px; height:26px; border-radius:8px; border:2px solid var(--muted); display:grid; place-items:center}
+.check svg{width:16px; height:16px; opacity:0}
+.check.on{background:var(--done); border-color:var(--done); color:#fff}
+.check.on svg{opacity:1}
+.task .tt{font-weight:700}
+.task .td{color:var(--muted); font-size:14px}
+.tag{display:inline-block; font-size:12px; font-weight:700; padding:1px 8px; border-radius:6px; background:var(--bg); color:var(--muted); margin-top:4px}
+.empty{background:var(--surface); border:1.5px dashed var(--line); border-radius:12px; padding:22px 16px; text-align:center; color:var(--muted)}
+
+/* inbox */
+.conv{display:flex; gap:12px; width:100%; text-align:left; background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:12px}
+.dot{flex:none; width:12px; height:12px; border-radius:50%; margin-top:6px}
+.dot.telegram{background:var(--tg)} .dot.tiktok{background:var(--tt)} .dot.site{background:var(--site)}
+.conv .who{display:flex; justify-content:space-between; gap:8px; font-weight:700}
+.conv .when{font-weight:500; font-size:13px; color:var(--muted)}
+.conv .pv{display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; color:var(--muted); font-size:14px}
+.conv.unread{border:2px solid var(--accent)}
+.badges{display:flex; gap:6px; margin-top:6px; flex-wrap:wrap}
+.badge{font-size:12px; font-weight:700; padding:1px 8px; border-radius:6px}
+.badge.ia{background:var(--bubble-ia); color:var(--done)}
+.badge.ch{background:var(--bg); color:var(--muted)}
+
+/* bots */
+.card{background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:10px}
+.card h3{margin:0; font-size:17px}
+.card p{margin:2px 0 0; color:var(--muted); font-size:14px}
+.row{display:flex; align-items:center; justify-content:space-between; gap:14px}
+.pill{flex:none; font-size:13px; font-weight:700; padding:3px 10px; border-radius:999px; background:var(--bubble-ia); color:var(--done)}
+.pill.off{background:var(--bg); color:var(--pending)}
+.sw{flex:none; width:50px; height:30px; border-radius:999px; border:0; background:var(--line); position:relative; padding:0}
+.sw::after{content:""; position:absolute; top:3px; left:3px; width:24px; height:24px; border-radius:50%; background:#fff; transition:transform .15s}
+.sw[aria-checked="true"]{background:var(--done)}
+.sw[aria-checked="true"]::after{transform:translateX(20px)}
+.section-title{font-size:18px; font-weight:800; margin:20px 0 10px}
+
+/* bottom nav */
+.nav{position:fixed; left:0; right:0; bottom:0; background:var(--surface); border-top:1px solid var(--line); padding:8px 12px calc(8px + env(safe-area-inset-bottom)); z-index:5}
+.nav .in{max-width:560px; margin:0 auto; display:grid; grid-template-columns:repeat(3,1fr); gap:6px}
+.nav button{position:relative; border:0; background:transparent; border-radius:10px; padding:8px 4px; font-weight:700; color:var(--muted)}
+.nav button[aria-current="page"]{background:var(--accent); color:var(--on-accent)}
+.nav .n{position:absolute; top:2px; right:14px; min-width:20px; height:20px; border-radius:10px; background:var(--pending); color:#fff; font-size:12px; font-weight:800; display:grid; place-items:center; padding:0 5px}
+
+/* conversation (lecture seule) */
+#conv{position:fixed; inset:0; background:var(--bg); z-index:10; display:flex; flex-direction:column}
+#conv[hidden]{display:none}
+.chead{display:flex; align-items:center; gap:10px; padding:12px; background:var(--surface); border-bottom:1px solid var(--line)}
+.chead .back{border:0; background:var(--bg); border-radius:10px; padding:8px 12px; font-weight:700}
+.chead .nm{font-weight:800}
+.chead .ch{font-size:13px; color:var(--muted)}
+#thread{flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:10px; max-width:560px; width:100%; margin:0 auto}
+.msg{max-width:84%; padding:9px 12px; border-radius:14px; background:var(--bubble-client); align-self:flex-start}
+.msg .by{font-size:12px; font-weight:700; color:var(--muted); margin-bottom:2px}
+.msg.bot{align-self:flex-end; background:var(--bubble-bot)}
+.msg.ia{align-self:flex-end; background:var(--bubble-ia)}
+.foot{padding:10px 14px calc(10px + env(safe-area-inset-bottom)); background:var(--surface); border-top:1px solid var(--line); text-align:center; color:var(--muted); font-size:14px}
+
+.btn{margin-top:10px; border:0; border-radius:10px; padding:10px 16px; font-weight:700; background:var(--accent); color:var(--on-accent)}
+@media (prefers-reduced-motion: reduce){ .sw::after{transition:none} }
+</style>
+</head>
+<body>
+
+<main class="app">
+  <div class="top">
+    <div>
+      <div class="brand">MERCADO</div>
+      <div class="today" id="today"></div>
+    </div>
+    <div class="status" id="status">Non connecté</div>
+  </div>
+  <div id="view"></div>
+</main>
+
+<nav class="nav" aria-label="Navigation principale">
+  <div class="in">
+    <button data-tab="tasks">Tâches<span class="n" id="n-tasks" hidden></span></button>
+    <button data-tab="inbox">Messages<span class="n" id="n-inbox" hidden></span></button>
+    <button data-tab="bots">Bots</button>
+  </div>
+</nav>
+
+<section id="conv" hidden aria-label="Conversation">
+  <div class="chead">
+    <button class="back" id="back" aria-label="Retour aux messages">Retour</button>
+    <div><div class="nm" id="c-name"></div><div class="ch" id="c-ch"></div></div>
+  </div>
+  <div id="thread" aria-live="polite"></div>
+  <div class="foot">Le bot gère cette conversation seul.</div>
+</section>
+
+<script>
+/* Cette page ne donne aucun ordre : le bot décide et agit.
+   Elle affiche ce qu'il a fait et ce qu'il lui reste à faire.
+   Dans l'APK, elle lit les données du bot via window.MercadoBot.
+   API_BASE reste vide (aucune API). */
+const API_BASE = "";
+const REFRESH_MS = 20000;
+
+const CHANNELS = {
+  telegram:{label:"Telegram"},
+  tiktok:{label:"TikTok"},
+  site:{label:"Site MERCADO"}
+};
+
+const state = {
+  tab:"tasks", filter:"pending", open:null, connected:false, paused:false,
+  bots:[
+    {id:"telegram", name:"Bot Telegram", text:"Te prévient pour chaque commande et chaque paiement.", on:true},
+    {id:"tiktok", name:"Bot TikTok", text:"Publie et répond aux commentaires et messages.", on:true},
+    {id:"site", name:"Bot du site", text:"Répond dans le chat de MERCADO.", on:true}
+  ],
+  tasks:[],
+  convs:[]
+};
+
+/* ---------- utilitaires ---------- */
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const CHECK = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5l3.2 3L13 4.5"/></svg>';
+
+async function call(path, method, body){
+  if(!API_BASE) return null;
+  try{
+    const r = await fetch(API_BASE + path, {
+      method: method || "GET",
+      headers: {"Content-Type":"application/json"},
+      body: body ? JSON.stringify(body) : undefined
+    });
+    if(!r.ok) throw new Error(r.status);
+    return await r.json();
+  }catch(e){ return null; }
+}
+
+async function load(){
+  if(window.MercadoBot){
+    try{
+      state.tasks = JSON.parse(MercadoBot.getTasks());
+      state.convs = JSON.parse(MercadoBot.getConversations());
+      const st = JSON.parse(MercadoBot.getSettings());
+      state.paused = !!st.paused;
+      state.connected = !!st.connected;
+      if(st.bots) state.bots.forEach(b => { if(b.id in st.bots) b.on = !!st.bots[b.id]; });
+    }catch(e){ state.connected = false; }
+    render();
+    if(state.open) renderThread();
+    return;
+  }
+  if(!API_BASE) return;
+  const [tasks, convs, settings] = await Promise.all([
+    call("/api/tasks"), call("/api/conversations"), call("/api/settings")
+  ]);
+  state.connected = !!(tasks && convs);
+  if(tasks) state.tasks = tasks;
+  if(convs) state.convs = convs;
+  if(settings){
+    state.paused = !!settings.paused;
+    if(settings.bots) state.bots.forEach(b => { if(b.id in settings.bots) b.on = !!settings.bots[b.id]; });
+  }
+  render();
+  if(state.open) renderThread();
+}
+
+/* ---------- affichage ---------- */
+const pendingCount = () => state.tasks.filter(t => !t.done).length;
+const unreadCount = () => state.convs.filter(c => c.unread).length;
+
+function renderTasks(){
+  const pend = state.tasks.filter(t => !t.done), done = state.tasks.filter(t => t.done);
+  const list = state.filter === "pending" ? pend : done;
+  let html = "";
+  if(state.filter === "pending" && pend[0]){
+    const n = pend[0];
+    html += `<div class="next"><h2>Le bot s'en occupe</h2><p class="t">${esc(n.title)}</p><p class="d">${esc(n.detail||"")}</p></div>`;
+  }
+  html += `<div class="seg" role="group" aria-label="Filtrer les tâches">
+    <button data-filter="pending" aria-pressed="${state.filter==="pending"}">En attente (${pend.length})</button>
+    <button data-filter="done" aria-pressed="${state.filter==="done"}">Accomplies (${done.length})</button></div>`;
+  if(!list.length){
+    html += `<div class="empty">${state.filter==="pending" ? "Rien en attente. Le bot a tout terminé." : "Le bot n'a encore rien accompli aujourd'hui."}</div>`;
+  }else{
+    html += `<ul class="list">` + list.map(t => `
+      <li class="task">
+        <span class="check ${t.done?"on":""}" role="img" aria-label="${t.done?"Accomplie":"En attente"}">${CHECK}</span>
+        <div><div class="tt">${esc(t.title)}</div><div class="td">${esc(t.detail||"")}</div><span class="tag">${esc(t.tag||"")}</span></div>
+      </li>`).join("") + `</ul>`;
+  }
+  return html;
+}
+
+function renderInbox(){
+  if(!state.convs.length) return `<div class="empty">Aucun message pour l'instant.</div>`;
+  return `<ul class="list">` + state.convs.map(c => {
+    const last = c.msgs[c.msgs.length-1] || {text:"", time:""};
+    const hasIa = c.msgs.some(m => m.from==="ia");
+    return `<li><button class="conv ${c.unread?"unread":""}" data-open="${c.id}">
+      <span class="dot ${c.channel}" aria-hidden="true"></span>
+      <span style="flex:1;min-width:0">
+        <span class="who"><span>${esc(c.name)}</span><span class="when">${esc(last.time)}</span></span>
+        <span class="pv">${esc(last.text)}</span>
+        <span class="badges"><span class="badge ch">${esc(CHANNELS[c.channel].label)}</span>
+          ${hasIa ? '<span class="badge ia">Réponse IA</span>' : ""}</span>
+      </span></button></li>`;
+  }).join("") + `</ul>`;
+}
+
+function renderBots(){
+  let html = `<div class="card"><div class="row">
+      <div><h3>${state.paused ? "Bots en pause" : "Bots en marche"}</h3>
+      <p>${state.paused ? "Rien n'est envoyé ni payé tant que la pause est active." : "Les bots décident et agissent seuls. Ce bouton est l'arrêt d'urgence."}</p></div>
+      <button class="sw" role="switch" aria-checked="${!state.paused}" aria-label="Bots en marche" data-pause="1"></button></div></div>`;
+  if(window.MercadoBot && !state.connected){
+    html += `<div class="card"><h3>Le bot ne peut pas agir</h3>
+      <p>Le service d'accessibilité est désactivé. Active MERCADO Bot dans les réglages d'accessibilité.</p>
+      <button class="btn" data-acc="1">Ouvrir les réglages</button></div>`;
+  }
+  html += `<div class="section-title">État des bots</div>`;
+  html += state.bots.map(b => {
+    const active = b.on && !state.paused;
+    return `<div class="card"><div class="row">
+      <div><h3>${esc(b.name)}</h3><p>${esc(b.text)}</p></div>
+      <span class="pill ${active?"":"off"}">${active?"Actif":"Arrêté"}</span></div></div>`;
+  }).join("");
+  html += `<div class="section-title">Quand le bot ne sait pas</div>
+    <div class="card"><h3>L'IA répond à sa place</h3>
+    <p>Si le bot ne connaît pas la langue ou ne sait pas quoi dire, l'IA écrit la réponse dans la langue du client. Tu retrouves chaque réponse dans Messages, marquée IA. Le bot connaît le français et l'anglais. Si le bot rencontre un problème, il demande aussi à l'IA quoi faire, et le problème avec la décision de l'IA apparaît dans Tâches.</p></div>`;
+  return html;
+}
+
+function render(){
+  $("#today").textContent = new Date().toLocaleDateString("fr-FR",{weekday:"long", day:"numeric", month:"long"});
+  const s = $("#status");
+  s.textContent = window.MercadoBot ? (state.connected ? "Connecté" : "Accessibilité désactivée") : API_BASE ? (state.connected ? "Connecté" : "Hors ligne") : "Non connecté";
+  s.classList.toggle("live", state.connected);
+  $("#view").innerHTML = state.tab==="tasks" ? renderTasks() : state.tab==="inbox" ? renderInbox() : renderBots();
+  document.querySelectorAll(".nav button").forEach(b => {
+    if(b.dataset.tab === state.tab) b.setAttribute("aria-current","page"); else b.removeAttribute("aria-current");
+  });
+  const nt = pendingCount(), ni = unreadCount();
+  $("#n-tasks").hidden = !nt; $("#n-tasks").textContent = nt;
+  $("#n-inbox").hidden = !ni; $("#n-inbox").textContent = ni;
+}
+
+function renderThread(){
+  const c = state.convs.find(x => x.id === state.open);
+  if(!c) return;
+  $("#thread").innerHTML = c.msgs.map(m => {
+    const by = m.from==="client" ? esc(c.name) : m.from==="ia" ? "IA" : "Bot";
+    return `<div class="msg ${m.from}"><div class="by">${by} - ${esc(m.time||"")}</div>${esc(m.text)}</div>`;
+  }).join("");
+  const t = $("#thread"); t.scrollTop = t.scrollHeight;
+}
+
+function openConv(id){
+  const c = state.convs.find(x => x.id === id); if(!c) return;
+  state.open = id; c.unread = false;
+  $("#c-name").textContent = c.name;
+  $("#c-ch").textContent = CHANNELS[c.channel].label;
+  $("#conv").hidden = false;
+  renderThread(); render();
+}
+function closeConv(){ state.open = null; $("#conv").hidden = true; render(); }
+
+/* ---------- interactions (navigation uniquement) ---------- */
+document.addEventListener("click", e => {
+  const el = e.target.closest("button"); if(!el) return;
+  const d = el.dataset;
+  if(d.tab){ state.tab = d.tab; render(); }
+  else if(d.filter){ state.filter = d.filter; render(); }
+  else if(d.open){ openConv(+d.open); }
+  else if(d.acc){ if(window.MercadoBot) MercadoBot.openAccessibility(); }
+  else if(d.pause){
+    state.paused = !state.paused;
+    call("/api/settings","POST",{paused:state.paused});
+    if(window.MercadoBot) MercadoBot.setPaused(state.paused);
+    render();
+  }
+});
+$("#back").addEventListener("click", closeConv);
+
+render();
+load();
+if(window.MercadoBot) setInterval(load, 5000);
+else if(API_BASE) setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>
