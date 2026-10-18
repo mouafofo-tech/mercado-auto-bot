@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">MERCADO Bot</string>
+    <string name="service_desc">Permet au bot MERCADO de lire l\'écran, appuyer et écrire pour répondre aux clients à ta place.</string>
+</resources>
