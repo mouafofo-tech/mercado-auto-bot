@@ -1,24 +1,38 @@
 package com.mercado.bot
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.app.KeyguardManager
 import android.app.Notification
+import android.content.Context
 import android.content.Intent
+import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+/** Levée quand tu actives la Pause : le bot s'arrête net. */
+private class PauseStop : RuntimeException()
 
 /**
- * Le bot. Il lit les notifications Telegram / TikTok, ouvre la conversation, répond
- * (modèles, réponses apprises, sinon ChatGPT), et note tout dans Store pour le dashboard.
+ * Le bot MERCADO.
+ *  - répond aux clients (Telegram / TikTok) : modèles, réponses apprises, sinon ChatGPT
+ *  - ne répond JAMAIS sur les prix : il attend que tu répondes toi-même
+ *  - prépare un brouillon TikTok (intro + vidéo CJ + texte à l'écran + légende)
+ *  - travaille seulement quand tu n'utilises pas le téléphone
  *
- * Règles de sécurité codées en dur :
- *  - ne touche jamais aux applis de paiement / banque / argent (voir BLOCKED)
+ * Sécurité codée en dur :
+ *  - ne touche jamais aux applis de paiement / banque / argent (BLOCKED)
  *  - n'écrit jamais dans un champ mot de passe
- *  - n'écrit que si le nom du client est visible à l'écran
- *  - s'arrête quand Pause est active ou quand la limite du jour est atteinte
+ *  - n'écrit à un client que si son nom est visible à l'écran
+ *  - TikTok : appuie sur "Drafts", jamais sur "Post"
+ *  - s'arrête avec la Pause ou à 200 actions par jour
  *  - ChatGPT ne peut choisir qu'une action de la liste ACTIONS
  */
 class BotService : AccessibilityService() {
@@ -29,20 +43,36 @@ class BotService : AccessibilityService() {
 
         const val CHATGPT = "com.openai.chatgpt"
         const val MARK = "REPONSE>>"
+        const val IDLE_MS = 3 * 60 * 1000L
 
         val WATCHED = mapOf(
             "org.telegram.messenger" to "telegram",
             "com.zhiliaoapp.musically" to "tiktok",
             "com.ss.android.ugc.trill" to "tiktok"
         )
-        val SEND_WORDS = listOf("send", "envoyer", "send message", "envoyer le message")
+        val SEND_WORDS = listOf(
+            "send", "envoyer", "send message", "envoyer le message",
+            "send prompt", "envoyer l'invite", "envoyer un message", "submit"
+        )
         val ACTIONS = listOf("RETRY", "BACK", "HOME", "RESTART", "WAIT", "SKIP")
         val BLOCKED = listOf("bank", "pay", "money", "wallet", "orange")
+        val SYSTEM_WORDS = listOf(
+            "upload", "téléchargement", "envoi de", "publié", "posted",
+            "brouillon", "draft", "traitement", "processing"
+        )
     }
 
     private val exec = Executors.newSingleThreadExecutor()
     private var lastKey = ""
     private var lastAt = 0L
+
+    @Volatile
+    private var lastUserActivity = System.currentTimeMillis()
+
+    @Volatile
+    private var botBusy = false
+
+    private var postNote = ""
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -58,14 +88,30 @@ class BotService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
-        if (e == null || e.eventType != AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) return
+        if (e == null) return
+
+        // Activité de l'utilisateur : tout ce qui bouge à l'écran quand le bot ne travaille pas.
+        if (e.eventType != AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
+            if (!botBusy && e.packageName?.toString() != packageName) {
+                lastUserActivity = System.currentTimeMillis()
+            }
+            return
+        }
+
         val pkg = e.packageName?.toString() ?: return
         val channel = WATCHED[pkg] ?: return
         val n = e.parcelableData as? Notification ?: return
         if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+        if (n.flags and Notification.FLAG_ONGOING_EVENT != 0) return
+        if (n.extras?.containsKey(Notification.EXTRA_PROGRESS_MAX) == true) return
+        val cat = n.category
+        if (cat == Notification.CATEGORY_PROGRESS || cat == Notification.CATEGORY_SERVICE ||
+            cat == Notification.CATEGORY_STATUS || cat == Notification.CATEGORY_TRANSPORT
+        ) return
         val title = n.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
         val text = n.extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
-        if (text.isBlank()) return
+        if (text.isBlank() || title.isBlank()) return
+        if (SYSTEM_WORDS.any { text.contains(it, ignoreCase = true) }) return
 
         val key = "$pkg|$title|$text"
         val now = System.currentTimeMillis()
@@ -73,17 +119,31 @@ class BotService : AccessibilityService() {
         lastKey = key
         lastAt = now
 
+        runJob { handleMessage(pkg, channel, title, text, n) }
+    }
+
+    private fun runJob(block: () -> Unit) {
         exec.execute {
             try {
-                handleMessage(pkg, channel, title, text, n)
+                block()
+            } catch (p: PauseStop) {
+                // Pause : on s'arrête sans bruit
             } catch (t: Throwable) {
                 Store.addTask("Problème interne", t.message ?: t.javaClass.simpleName, "Problème")
+            } finally {
+                botBusy = false
+                releaseScreen()
             }
         }
     }
 
+    /** Appelé par le bouton de test du dashboard. */
+    fun postNow() {
+        runJob { postDraft() }
+    }
+
     // ------------------------------------------------------------------
-    // Cerveau
+    // Quand le téléphone est libre
     // ------------------------------------------------------------------
     private fun canAct(): Boolean = !Store.paused && Store.actionsToday() < Store.DAILY_LIMIT
 
@@ -92,26 +152,95 @@ class BotService : AccessibilityService() {
         return BLOCKED.none { p.contains(it) }
     }
 
+    private var wake: PowerManager.WakeLock? = null
+
+    /** Allume l'écran et le garde allumé pendant le travail du bot. */
+    private fun holdScreen(pm: PowerManager) {
+        releaseScreen()
+        @Suppress("DEPRECATION")
+        val wl = pm.newWakeLock(
+            PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "mercado:bot"
+        )
+        wl.acquire(15 * 60 * 1000L)
+        wake = wl
+        Thread.sleep(1500)
+    }
+
+    private fun releaseScreen() {
+        val wl = wake
+        if (wl != null && wl.isHeld) wl.release()
+        wake = null
+    }
+
+    /** Attend que le téléphone soit libre (rien touché depuis 3 minutes), puis allume l'écran. */
+    private fun waitForIdle(maxMs: Long): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        val end = System.currentTimeMillis() + maxMs
+        while (System.currentTimeMillis() < end) {
+            if (Store.paused) return false
+            val idle = System.currentTimeMillis() - lastUserActivity >= IDLE_MS
+            if (idle && !km.isKeyguardLocked) {
+                holdScreen(pm)
+                if (pm.isInteractive) return true
+                releaseScreen()
+            }
+            Thread.sleep(15000)
+        }
+        return false
+    }
+
+    // ------------------------------------------------------------------
+    // Réponses aux clients
+    // ------------------------------------------------------------------
     private fun handleMessage(pkg: String, channel: String, title: String, text: String, n: Notification) {
         if (!canAct() || !safePkg(pkg)) return
+
+        // Règle : jamais de prix. Le bot attend, c'est toi qui réponds.
+        if (Brain.asksPrice(text)) {
+            Store.addMessage(channel, title, "client", text)
+            Store.addTask("À toi : $title demande le prix", text.take(90), "À toi")
+            return
+        }
+
         val tag = if (channel == "tiktok") "TikTok" else "Telegram"
         val taskId = Store.addTask("Répondre à $title", text.take(90), tag)
+        val history = Store.history(channel, title)
         Store.addMessage(channel, title, "client", text)
 
+        try {
+            if (!waitForIdle(20 * 60 * 1000L)) {
+                Store.updateTask(taskId, false, "Téléphone utilisé trop longtemps : réponds toi-même")
+                return
+            }
+            botBusy = true
+            replyAndSend(pkg, channel, title, text, n, taskId, history)
+        } catch (p: PauseStop) {
+            Store.updateTask(taskId, false, "Interrompu par la Pause")
+        }
+        performGlobalAction(GLOBAL_ACTION_HOME)
+    }
+
+    private fun replyAndSend(
+        pkg: String, channel: String, title: String, text: String,
+        n: Notification, taskId: Long, history: String
+    ) {
         var from = "bot"
         var reply: String? = Brain.reply(text)
         var fromAi = false
         if (reply == null) {
             from = "ia"
             reply = askChatGpt(
-                "Un client de ma boutique en ligne écrit : \"${text.take(300)}\". " +
-                    "Écris une courte réponse polie de vendeur, dans la langue du client."
+                (if (history.isNotBlank()) "Début de la conversation : ${history.takeLast(600)} " else "") +
+                    "Un client de ma boutique en ligne écrit : \"${text.take(300)}\". " +
+                    "Écris une courte réponse polie de vendeur, dans la langue du client. " +
+                    "Ne donne jamais de prix."
             )
             fromAi = reply != null
         }
-        val msg = reply?.replace("\n", " ")?.trim()?.takeIf { it.isNotBlank() } ?: run {
+        val msg = Brain.noPrice(reply?.replace("\n", " ")?.trim() ?: "").takeIf { it.isNotBlank() } ?: run {
             Store.updateTask(taskId, false, "Aucune réponse trouvée (ChatGPT indisponible)")
-            performGlobalAction(GLOBAL_ACTION_HOME)
             return
         }
 
@@ -134,7 +263,6 @@ class BotService : AccessibilityService() {
         } else {
             Store.updateTask(taskId, false, "Échec après 2 essais")
         }
-        performGlobalAction(GLOBAL_ACTION_HOME)
     }
 
     /** En cas de problème, le bot demande à ChatGPT de choisir UNE action dans une liste sûre. */
@@ -187,6 +315,296 @@ class BotService : AccessibilityService() {
     }
 
     // ------------------------------------------------------------------
+    // Brouillon TikTok : intro + vidéo CJ + texte + légende, puis "Drafts"
+    // ------------------------------------------------------------------
+    private fun postDraft() {
+        if (!canAct()) return
+        val taskId = Store.addTask("Brouillon TikTok", "En attente que le téléphone soit libre", "TikTok")
+        try {
+            if (!waitForIdle(30 * 60 * 1000L)) {
+                Store.updateTask(taskId, false, "Téléphone utilisé ou verrouillé : abandonné")
+                return
+            }
+            botBusy = true
+            Store.updateTask(taskId, false, "Publication en cours")
+            postNote = ""
+            val err = saveCjVideo() ?: doPostDraft()
+            Store.record("tiktok|draft", err == null)
+            if (err == null) {
+                Store.countAction()
+                Store.updateTask(taskId, true, "Brouillon enregistré ($postNote)")
+            } else {
+                Store.updateTask(taskId, false, "Échec : $err")
+            }
+        } catch (p: PauseStop) {
+            Store.updateTask(taskId, false, "Interrompu par la Pause")
+        }
+        performGlobalAction(GLOBAL_ACTION_HOME)
+    }
+
+    /** Retourne null si tout s'est bien passé, sinon le nom de l'étape qui a échoué. */
+    private fun doPostDraft(): String? {
+        val pkg = tiktokPkg() ?: return "TikTok introuvable"
+
+        // 1. Les textes (ChatGPT, sinon textes par défaut). Jamais de prix.
+        val raw = askChatGpt(
+            "You write TikTok text for a UK online shop called MERCADO. " +
+                "Reply with exactly two parts separated by ||. " +
+                "Part 1: on-screen text, 6 words maximum. " +
+                "Part 2: caption, 100 characters maximum, with 4 relevant hashtags. " +
+                "Never mention prices. No delivery time claims and no limited stock claims."
+        )
+        val parsed = Brain.parsePost(raw)
+        val overlay = Brain.noPrice(parsed.first)
+        val caption = Brain.noPrice(parsed.second)
+
+        // 2. Ouvrir TikTok et compter les brouillons avant.
+        if (!launch(pkg) || !waitFor(10000) { fg() == pkg }) return postFail("ouverture de TikTok")
+        Thread.sleep(Store.settleMs(pkg))
+        if (!goProfile(pkg)) return postFail("profil introuvable")
+        val before = draftsCount() ?: 0
+
+        // 3. Bouton + puis galerie.
+        val plus = findByRegion(0.42, 0.58, 0.92, 0.99) ?: return postFail("bouton + introuvable")
+        click(plus)
+        if (!waitFor(10000) { findText("Add sound") != null }) return postFail("écran caméra")
+
+        val thumb = findByRegion(0.03, 0.19, 0.85, 0.93) ?: return postFail("miniature de la galerie")
+        click(thumb)
+        if (!waitFor(8000) { findText("Select multiple") != null || findText("Recents") != null }) {
+            return postFail("galerie")
+        }
+        if (!clickText(4000, "Videos")) return postFail("onglet Videos")
+        Thread.sleep(1500)
+        val sm = waitNode(5000) { findText("Select multiple") } ?: return postFail("Select multiple")
+        if (!isCheckedChain(sm)) click(sm)
+        Thread.sleep(800)
+
+        // 4. L'intro (4 secondes) d'abord, puis la vidéo CJ la plus récente.
+        val intro = durationTiles().firstOrNull { it.first == "00:04" }
+            ?: return postFail("intro de 4 secondes introuvable")
+        click(intro.second)
+        Thread.sleep(900)
+        val cj = durationTiles().firstOrNull { it.first != "00:04" }
+            ?: return postFail("vidéo CJ introuvable")
+        click(cj.second)
+        Thread.sleep(900)
+        val next = waitNode(5000) { findStartsWith("Next") } ?: return postFail("bouton Next")
+        click(next)
+        if (!waitFor(25000) { findText("Sound") != null && findText("Text") != null }) {
+            return postFail("éditeur")
+        }
+
+        // 5. Texte à l'écran (si ça échoue, on continue : c'est juste un brouillon).
+        var textOk = false
+        if (clickText(3000, "Text")) {
+            val ed = waitNode(5000) { editables().firstOrNull() }
+            if (ed != null && setText(ed, overlay)) {
+                Thread.sleep(600)
+                textOk = clickText(4000, "Done")
+            }
+        }
+        Thread.sleep(1000)
+
+        // 6. Flèche rouge en haut à droite : écran de publication.
+        val arrow = findByRegion(0.82, 0.98, 0.03, 0.10) ?: return postFail("flèche suivante")
+        click(arrow)
+        if (!waitFor(25000) { findText("Drafts") != null && findText("Post") != null }) {
+            return postFail("écran de publication")
+        }
+
+        // 7. Légende.
+        var capOk = false
+        val capNode = editables().maxByOrNull { val b = Rect(); it.getBoundsInScreen(b); b.height() }
+        if (capNode != null) {
+            capOk = setText(capNode, caption)
+            Thread.sleep(800)
+        }
+        postNote = "texte à l'écran : " + (if (textOk) "oui" else "non") +
+            ", légende : " + (if (capOk) "oui" else "non")
+
+        // 8. Drafts, jamais Post.
+        val drafts = findText("Drafts") ?: return postFail("bouton Drafts")
+        if (!clickNarrow(drafts, 0.7)) return postFail("clic sur Drafts")
+        Thread.sleep(6000)
+
+        // 9. Vérification : le nombre de brouillons doit avoir augmenté.
+        if (!goProfile(pkg)) return postFail("retour au profil")
+        if (!waitFor(20000) { (draftsCount() ?: 0) > before }) {
+            return postFail("brouillon non confirmé (avant : $before)")
+        }
+        return null
+    }
+
+    // ------------------------------------------------------------------
+    // Appli CJ : produit avec beaucoup de "Lists", appui long sur la vidéo, "Save video to album?" > OK
+    // ------------------------------------------------------------------
+    private fun cjPkg(): String? {
+        val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        return packageManager.queryIntentActivities(i, 0)
+            .firstOrNull { it.loadLabel(packageManager).toString().contains("CJdrop", ignoreCase = true) }
+            ?.activityInfo?.packageName
+    }
+
+    private fun listsCounts(): List<Pair<Long, AccessibilityNodeInfo>> {
+        val re = Regex("(\\d[\\d,]*)\\s*Lists", RegexOption.IGNORE_CASE)
+        val out = ArrayList<Pair<Long, AccessibilityNodeInfo>>()
+        for (n in allNodes()) {
+            if (!n.isVisibleToUser) continue
+            val t = n.text?.toString() ?: continue
+            val m = re.find(t) ?: continue
+            val v = m.groupValues[1].replace(",", "").toLongOrNull() ?: continue
+            out.add(Pair(v, n))
+        }
+        return out.sortedByDescending { it.first }
+    }
+
+    /** Retourne null si la vidéo est enregistrée dans la galerie, sinon l'étape qui a échoué. */
+    private fun saveCjVideo(): String? {
+        val pkg = cjPkg() ?: return cjFail("appli CJ introuvable")
+        if (!launch(pkg) || !waitFor(12000) { fg() == pkg }) return cjFail("ouverture de CJ")
+        Thread.sleep(Store.settleMs(pkg) + 1500)
+
+        for (i in 0 until 4) {
+            if (fg() != pkg) {
+                launch(pkg)
+                waitFor(8000) { fg() == pkg }
+                Thread.sleep(2000)
+            }
+            if (findText("Products") != null) break
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            Thread.sleep(1200)
+        }
+        if (!clickText(6000, "Products")) return cjFail("onglet Products")
+        if (!waitFor(12000) { listsCounts().isNotEmpty() }) return cjFail("liste de produits")
+        Thread.sleep(1500)
+
+        val tried = ArrayList<Long>()
+        for (round in 0 until 3) {
+            val cand = listsCounts().firstOrNull { it.first !in tried } ?: break
+            tried.add(cand.first)
+            click(cand.second)
+            val onPage = waitFor(12000) { findText("Buy Sample") != null || findText("Video Gallery") != null }
+            if (onPage && longPressVideo() && clickText(4000, "OK")) {
+                Thread.sleep(10000)
+                Store.record("cj|save", true)
+                return null
+            }
+            Store.record("cj|save", false)
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            Thread.sleep(1500)
+            if (!waitFor(8000) { listsCounts().isNotEmpty() }) break
+        }
+        return cjFail("vidéo non enregistrée")
+    }
+
+    /** Appui long sur la vidéo du produit : d'abord par l'accessibilité, sinon par un geste. */
+    private fun longPressVideo(): Boolean {
+        if (Store.paused) throw PauseStop()
+        val node = findByRegion(0.35, 0.65, 0.22, 0.32)
+        if (node != null) {
+            var cur: AccessibilityNodeInfo? = node
+            var i = 0
+            while (cur != null && i < 6) {
+                if (cur.isLongClickable && cur.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)) break
+                cur = cur.parent
+                i++
+            }
+            if (waitFor(2500) { findStartsWith("Save video") != null }) return true
+        }
+        val dm = resources.displayMetrics
+        longPressAt(dm.widthPixels * 0.5f, dm.heightPixels * 0.27f)
+        return waitFor(3000) { findStartsWith("Save video") != null }
+    }
+
+    private fun longPressAt(x: Float, y: Float) {
+        if (Store.paused) throw PauseStop()
+        val path = Path()
+        path.moveTo(x, y)
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 1200L)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        val latch = CountDownLatch(1)
+        val sent = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) { latch.countDown() }
+            override fun onCancelled(gestureDescription: GestureDescription?) { latch.countDown() }
+        }, null)
+        if (sent) latch.await(4, TimeUnit.SECONDS)
+    }
+
+    private fun cjFail(step: String): String {
+        val d = Store.addTask("Diagnostic CJ : $step", dumpScreen(), "Problème")
+        Store.updateTask(d, true)
+        return "CJ : $step"
+    }
+
+    private fun tiktokPkg(): String? =
+        WATCHED.filter { it.value == "tiktok" }.keys
+            .firstOrNull { packageManager.getLaunchIntentForPackage(it) != null }
+
+    private fun goProfile(pkg: String): Boolean {
+        for (i in 0 until 6) {
+            if (fg() != pkg) {
+                launch(pkg)
+                waitFor(6000) { fg() == pkg }
+            }
+            val p = findText("Profile")
+            if (p != null) {
+                click(p)
+                Thread.sleep(1500)
+                if (waitFor(6000) { findText("TikTok Studio") != null || draftsCount() != null }) return true
+            }
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            Thread.sleep(1200)
+        }
+        return false
+    }
+
+    private fun draftsCount(): Int? {
+        val re = Regex("Drafts:\\s*(\\d+)")
+        for (n in allNodes()) {
+            val t = n.text?.toString() ?: continue
+            val m = re.find(t)
+            if (m != null) return m.groupValues[1].toIntOrNull()
+        }
+        return null
+    }
+
+    private fun postFail(step: String): String {
+        val d = Store.addTask("Diagnostic TikTok : $step", dumpScreen(), "Problème")
+        Store.updateTask(d, true)
+        return step
+    }
+
+    private fun dumpScreen(): String =
+        allNodes()
+            .filter { it.isVisibleToUser }
+            .mapNotNull { n -> (n.text ?: n.contentDescription)?.toString()?.trim()?.takeIf { it.isNotEmpty() } }
+            .distinct()
+            .joinToString(" | ")
+            .take(900)
+
+    private fun durationTiles(): List<Pair<String, AccessibilityNodeInfo>> {
+        val re = Regex("\\d{1,2}:\\d{2}")
+        val out = ArrayList<Pair<String, AccessibilityNodeInfo>>()
+        for (n in allNodes()) {
+            val t = n.text?.toString()?.trim() ?: continue
+            if (n.isVisibleToUser && re.matches(t)) out.add(Pair(t, n))
+        }
+        return out.sortedWith(
+            compareBy<Pair<String, AccessibilityNodeInfo>>(
+                { centerOf(it.second).second / 60 },
+                { centerOf(it.second).first }
+            )
+        )
+    }
+
+    private fun centerOf(n: AccessibilityNodeInfo): Pair<Int, Int> {
+        val b = Rect()
+        n.getBoundsInScreen(b)
+        return Pair(b.centerX(), b.centerY())
+    }
+
+    // ------------------------------------------------------------------
     // Manipulation de l'écran
     // ------------------------------------------------------------------
     private fun fg(): String? = rootInActiveWindow?.packageName?.toString()
@@ -232,7 +650,61 @@ class BotService : AccessibilityService() {
     private fun screenContains(s: String): Boolean =
         allNodes().any { it.text?.toString()?.contains(s, ignoreCase = true) == true }
 
+    private fun findText(vararg words: String): AccessibilityNodeInfo? =
+        allNodes().firstOrNull { n ->
+            n.isVisibleToUser && words.any { w ->
+                n.text?.toString()?.trim().equals(w, ignoreCase = true) ||
+                    n.contentDescription?.toString()?.trim().equals(w, ignoreCase = true)
+            }
+        }
+
+    private fun findStartsWith(prefix: String): AccessibilityNodeInfo? =
+        allNodes().firstOrNull { n ->
+            n.isVisibleToUser &&
+                (n.text?.toString()?.trim()?.startsWith(prefix, ignoreCase = true) == true)
+        }
+
+    private fun clickText(ms: Long, vararg words: String): Boolean {
+        val n = waitNode(ms) { findText(*words) } ?: return false
+        return click(n)
+    }
+
+    /** Le plus petit élément visible dont le centre est dans cette zone de l'écran (en fractions). */
+    private fun findByRegion(x0: Double, x1: Double, y0: Double, y1: Double): AccessibilityNodeInfo? {
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels.toDouble()
+        val h = dm.heightPixels.toDouble()
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = Long.MAX_VALUE
+        for (n in allNodes()) {
+            if (!n.isVisibleToUser) continue
+            val b = Rect()
+            n.getBoundsInScreen(b)
+            val area = b.width().toLong() * b.height().toLong()
+            if (area <= 0L) continue
+            val cx = b.centerX() / w
+            val cy = b.centerY() / h
+            if (cx in x0..x1 && cy in y0..y1 && area < bestArea) {
+                best = n
+                bestArea = area
+            }
+        }
+        return best
+    }
+
+    private fun isCheckedChain(n: AccessibilityNodeInfo): Boolean {
+        var cur: AccessibilityNodeInfo? = n
+        var i = 0
+        while (cur != null && i < 3) {
+            if (cur.isChecked) return true
+            cur = cur.parent
+            i++
+        }
+        return false
+    }
+
     private fun click(node: AccessibilityNodeInfo): Boolean {
+        if (Store.paused) throw PauseStop()
         var cur: AccessibilityNodeInfo? = node
         var i = 0
         while (cur != null && i < 6) {
@@ -243,10 +715,37 @@ class BotService : AccessibilityService() {
         return false
     }
 
+    /** Comme click, mais refuse de remonter jusqu'à un conteneur large (évite de toucher le mauvais bouton). */
+    private fun clickNarrow(node: AccessibilityNodeInfo, maxFrac: Double): Boolean {
+        if (Store.paused) throw PauseStop()
+        val maxWidth = resources.displayMetrics.widthPixels * maxFrac
+        var cur: AccessibilityNodeInfo? = node
+        var i = 0
+        while (cur != null && i < 4) {
+            val b = Rect()
+            cur.getBoundsInScreen(b)
+            if (b.width() > maxWidth) return false
+            if (cur.isClickable && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            cur = cur.parent
+            i++
+        }
+        return false
+    }
+
+    private fun editables(): List<AccessibilityNodeInfo> =
+        allNodes().filter { it.isEditable && it.isVisibleToUser }
+
     private fun findEditable(): AccessibilityNodeInfo? =
-        allNodes()
-            .filter { it.isEditable && it.isVisibleToUser }
-            .maxByOrNull { val b = Rect(); it.getBoundsInScreen(b); b.top }
+        editables().maxByOrNull { val b = Rect(); it.getBoundsInScreen(b); b.top }
+
+    private fun setText(node: AccessibilityNodeInfo, text: String): Boolean {
+        if (Store.paused) throw PauseStop()
+        if (node.isPassword) return false
+        val args = Bundle()
+        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
 
     private fun openChat(pkg: String, title: String, n: Notification): Boolean {
         val t0 = System.currentTimeMillis()
@@ -266,20 +765,28 @@ class BotService : AccessibilityService() {
     private fun sendText(pkg: String, text: String): Boolean {
         if (Store.paused || !safePkg(pkg) || fg() != pkg) return false
         val edit = waitNode(5000) { findEditable() } ?: return false
-        if (edit.isPassword) return false
-        val args = Bundle()
-        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
-        edit.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        if (!edit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return false
+        if (!setText(edit, text)) return false
         Thread.sleep(600)
         val cur = findEditable()?.text?.toString() ?: ""
         if (!cur.startsWith(text.take(10))) return false
         return pressSend(pkg)
     }
 
+    /** Liste les boutons visibles, pour comprendre pourquoi l'envoi a échoué. */
+    private fun dumpClickables(): String =
+        allNodes()
+            .filter { it.isClickable && it.isVisibleToUser }
+            .joinToString(" | ") { n ->
+                val b = Rect()
+                n.getBoundsInScreen(b)
+                "d=" + (n.contentDescription ?: "") + ",t=" + (n.text ?: "") +
+                    ",id=" + (n.viewIdResourceName ?: "") + ",x=" + b.centerX() + ",y=" + b.centerY()
+            }
+            .take(900)
+
     /** Essaie plusieurs façons d'appuyer sur Envoyer, la plus réussie d'abord (apprentissage). */
     private fun pressSend(pkg: String): Boolean {
-        val order = listOf("desc", "text", "id", "right", "ime")
+        val order = listOf("desc", "text", "id", "has", "right", "ime")
             .sortedByDescending { Store.score("$pkg|send|$it") }
         for (t in order) {
             if (Store.paused) return false
@@ -294,6 +801,8 @@ class BotService : AccessibilityService() {
             Store.record("$pkg|send|$t", cleared)
             if (cleared) return true
         }
+        val d = Store.addTask("Diagnostic envoi ($pkg)", dumpClickables(), "Problème")
+        Store.updateTask(d, true)
         return false
     }
 
@@ -313,6 +822,10 @@ class BotService : AccessibilityService() {
                 d != null && SEND_WORDS.contains(d)
             }
             "id" -> nodes.firstOrNull { it.viewIdResourceName?.lowercase()?.contains("send") == true }
+            "has" -> nodes.firstOrNull { n ->
+                val d = ((n.contentDescription?.toString() ?: "") + " " + (n.text?.toString() ?: "")).lowercase()
+                n.isVisibleToUser && !n.isEditable && (d.contains("send") || d.contains("envoy"))
+            }
             "right" -> findEditable()?.let { rightOf(it, nodes) }
             else -> null
         }
@@ -326,7 +839,7 @@ class BotService : AccessibilityService() {
             .filter { n ->
                 val b = Rect()
                 n.getBoundsInScreen(b)
-                n != e && n.isClickable && n.isVisibleToUser &&
+                n != e && n.isVisibleToUser &&
                     b.centerX() > eb.centerX() && b.centerY() in eb.top..eb.bottom &&
                     b.width() < eb.width() / 2
             }
