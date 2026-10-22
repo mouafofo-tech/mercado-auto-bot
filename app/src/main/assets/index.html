@@ -142,7 +142,6 @@ button{font:inherit; color:inherit; cursor:pointer}
 
 <script>
 /* Cette page ne donne aucun ordre : le bot décide et agit.
-   Elle affiche ce qu'il a fait et ce qu'il lui reste à faire.
    Dans l'APK, elle lit les données du bot via window.MercadoBot.
    API_BASE reste vide (aucune API). */
 const API_BASE = "";
@@ -222,7 +221,7 @@ function renderTasks(){
   let html = "";
   if(state.filter === "pending" && pend[0]){
     const n = pend[0];
-    html += `<div class="next"><h2>Le bot s'en occupe</h2><p class="t">${esc(n.title)}</p><p class="d">${esc(n.detail||"")}</p></div>`;
+    html += `<div class="next"><h2>${n.tag==="À toi" ? "À toi de répondre" : "Le bot s'en occupe"}</h2><p class="t">${esc(n.title)}</p><p class="d">${esc(n.detail||"")}</p></div>`;
   }
   html += `<div class="seg" role="group" aria-label="Filtrer les tâches">
     <button data-filter="pending" aria-pressed="${state.filter==="pending"}">En attente (${pend.length})</button>
@@ -264,6 +263,11 @@ function renderBots(){
     html += `<div class="card"><h3>Le bot ne peut pas agir</h3>
       <p>Le service d'accessibilité est désactivé. Active MERCADO Bot dans les réglages d'accessibilité.</p>
       <button class="btn" data-acc="1">Ouvrir les réglages</button></div>`;
+  }
+  if(window.MercadoBot && state.connected){
+    html += `<div class="card"><h3>Test de publication</h3>
+      <p>Le bot prépare un brouillon TikTok avec l'intro et ta dernière vidéo de la galerie. Pour tester seulement.</p>
+      <button class="btn" data-post="1">Tester maintenant</button></div>`;
   }
   html += `<div class="section-title">État des bots</div>`;
   html += state.bots.map(b => {
@@ -320,6 +324,7 @@ document.addEventListener("click", e => {
   else if(d.filter){ state.filter = d.filter; render(); }
   else if(d.open){ openConv(+d.open); }
   else if(d.acc){ if(window.MercadoBot) MercadoBot.openAccessibility(); }
+  else if(d.post){ if(window.MercadoBot) MercadoBot.postNow(); }
   else if(d.pause){
     state.paused = !state.paused;
     call("/api/settings","POST",{paused:state.paused});
