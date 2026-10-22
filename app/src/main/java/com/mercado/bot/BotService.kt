@@ -6,13 +6,28 @@ import android.app.KeyguardManager
 import android.app.Notification
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
 import android.graphics.Path
+import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -44,6 +59,9 @@ class BotService : AccessibilityService() {
         const val CHATGPT = "com.openai.chatgpt"
         const val MARK = "REPONSE>>"
         const val IDLE_MS = 3 * 60 * 1000L
+        const val LOCK_START = 19 * 60
+        const val LOCK_END = 21 * 60 + 30
+        val CALL_WORDS = listOf("incallui", "dialer", "telecom", "com.android.phone")
 
         val WATCHED = mapOf(
             "org.telegram.messenger" to "telegram",
@@ -78,10 +96,14 @@ class BotService : AccessibilityService() {
         super.onServiceConnected()
         Store.init(this)
         instance = this
+        main.removeCallbacks(ticker)
+        main.post(ticker)
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
         instance = null
+        main.removeCallbacks(ticker)
+        hideOverlay()
         return super.onUnbind(intent)
     }
 
@@ -89,6 +111,15 @@ class BotService : AccessibilityService() {
 
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
         if (e == null) return
+
+        // Un appel arrive : le bot rend le téléphone pendant 5 minutes.
+        if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val p = e.packageName?.toString()?.lowercase() ?: ""
+            if (CALL_WORDS.any { p.contains(it) }) {
+                emergencyUntil = System.currentTimeMillis() + 5 * 60 * 1000L
+                hideOverlay()
+            }
+        }
 
         // Activité de l'utilisateur : tout ce qui bouge à l'écran quand le bot ne travaille pas.
         if (e.eventType != AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
@@ -181,7 +212,7 @@ class BotService : AccessibilityService() {
         while (System.currentTimeMillis() < end) {
             if (Store.paused) return false
             val idle = System.currentTimeMillis() - lastUserActivity >= IDLE_MS
-            if (idle && !km.isKeyguardLocked) {
+            if ((idle || overlay != null) && !km.isKeyguardLocked) {
                 holdScreen(pm)
                 if (pm.isInteractive) return true
                 releaseScreen()
@@ -524,17 +555,178 @@ class BotService : AccessibilityService() {
         val stroke = GestureDescription.StrokeDescription(path, 0L, 1200L)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         val latch = CountDownLatch(1)
-        val sent = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription?) { latch.countDown() }
-            override fun onCancelled(gestureDescription: GestureDescription?) { latch.countDown() }
-        }, null)
-        if (sent) latch.await(4, TimeUnit.SECONDS)
+        overlayBlocksTouches(false)
+        try {
+            Thread.sleep(300)
+            val sent = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) { latch.countDown() }
+                override fun onCancelled(gestureDescription: GestureDescription?) { latch.countDown() }
+            }, null)
+            if (sent) latch.await(4, TimeUnit.SECONDS)
+        } finally {
+            overlayBlocksTouches(true)
+        }
     }
 
     private fun cjFail(step: String): String {
         val d = Store.addTask("Diagnostic CJ : $step", dumpScreen(), "Problème")
         Store.updateTask(d, true)
         return "CJ : $step"
+    }
+
+    // ------------------------------------------------------------------
+    // Heures du bot : du lundi au vendredi, de 19:00 à 21:30, le bot prend le téléphone
+    // ------------------------------------------------------------------
+    private val main = Handler(Looper.getMainLooper())
+
+    @Volatile
+    private var overlay: FrameLayout? = null
+    private var overlayStatus: TextView? = null
+
+    @Volatile
+    private var emergencyUntil = 0L
+
+    private val ticker = object : Runnable {
+        override fun run() {
+            try { tick() } catch (t: Throwable) { }
+            main.postDelayed(this, 5000)
+        }
+    }
+
+    private fun inLockWindow(): Boolean {
+        val c = Calendar.getInstance()
+        val d = c.get(Calendar.DAY_OF_WEEK)
+        if (d == Calendar.SATURDAY || d == Calendar.SUNDAY) return false
+        val m = c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
+        return m >= LOCK_START && m < LOCK_END
+    }
+
+    private fun tick() {
+        val now = System.currentTimeMillis()
+        val inWindow = inLockWindow()
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val inCall = am.mode == AudioManager.MODE_IN_CALL ||
+            am.mode == AudioManager.MODE_RINGTONE ||
+            am.mode == AudioManager.MODE_IN_COMMUNICATION
+        val want = inWindow && !Store.paused && now >= emergencyUntil && !inCall
+        if (want && overlay == null) showOverlay()
+        if (!want && overlay != null) hideOverlay()
+        overlayStatus?.text = statusText()
+        if (inWindow && !Store.paused) startDailyDraft()
+    }
+
+    /** Un brouillon TikTok par jour d'ouverture, au début des heures du bot. */
+    private fun startDailyDraft() {
+        val day = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+        val p = getSharedPreferences("mercado_sched", Context.MODE_PRIVATE)
+        if (p.getString("draftDay", "") == day) return
+        p.edit().putString("draftDay", day).apply()
+        postNow()
+    }
+
+    private fun statusText(): String {
+        val c = Calendar.getInstance()
+        val m = c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
+        val left = LOCK_END - m
+        val back = String.format(Locale.US, "%02d:%02d", LOCK_END / 60, LOCK_END % 60)
+        val last = Store.tasks().optJSONObject(0)?.optString("title") ?: ""
+        return "Ton téléphone revient à $back (dans $left min)." +
+            (if (last.isNotBlank()) "\nDernière tâche : $last" else "")
+    }
+
+    private fun showOverlay() {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val root = FrameLayout(this)
+        root.setBackgroundColor(Color.parseColor("#F2151A3D"))
+        root.isClickable = true
+
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.gravity = Gravity.CENTER
+
+        val title = TextView(this)
+        title.text = "MERCADO Bot travaille"
+        title.setTextColor(Color.parseColor("#F2B100"))
+        title.textSize = 28f
+        title.gravity = Gravity.CENTER
+
+        val status = TextView(this)
+        status.setTextColor(Color.WHITE)
+        status.textSize = 18f
+        status.gravity = Gravity.CENTER
+        status.setPadding(48, 32, 48, 64)
+        status.text = statusText()
+
+        val urgence = TextView(this)
+        urgence.text = "URGENCE : reste appuyé 10 secondes"
+        urgence.setTextColor(Color.WHITE)
+        urgence.textSize = 16f
+        urgence.gravity = Gravity.CENTER
+        urgence.setPadding(40, 32, 40, 32)
+        urgence.setBackgroundColor(Color.parseColor("#C42A39"))
+
+        val release = Runnable {
+            emergencyUntil = System.currentTimeMillis() + 3 * 60 * 1000L
+            hideOverlay()
+        }
+        urgence.setOnTouchListener { _, ev ->
+            when (ev.action) {
+                MotionEvent.ACTION_DOWN -> main.postDelayed(release, 10000L)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> main.removeCallbacks(release)
+            }
+            true
+        }
+
+        col.addView(title)
+        col.addView(status)
+        col.addView(urgence)
+        root.addView(
+            col,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            )
+        )
+
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+            PixelFormat.TRANSLUCENT
+        )
+        lp.screenBrightness = 0.1f
+        wm.addView(root, lp)
+        overlay = root
+        overlayStatus = status
+    }
+
+    private fun hideOverlay() {
+        val v = overlay ?: return
+        try {
+            (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(v)
+        } catch (e: Exception) { }
+        overlay = null
+        overlayStatus = null
+    }
+
+    /** Laisse passer un geste du bot à travers la couverture (block = false), puis la referme. */
+    private fun overlayBlocksTouches(block: Boolean) {
+        main.post {
+            val v = overlay ?: return@post
+            val lp = v.layoutParams as? WindowManager.LayoutParams ?: return@post
+            lp.flags = if (block) {
+                lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+            } else {
+                lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            }
+            try {
+                (getSystemService(Context.WINDOW_SERVICE) as WindowManager).updateViewLayout(v, lp)
+            } catch (e: Exception) { }
+        }
     }
 
     private fun tiktokPkg(): String? =
