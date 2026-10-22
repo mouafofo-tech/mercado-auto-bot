@@ -5,7 +5,7 @@ import android.provider.Settings
 import android.webkit.JavascriptInterface
 import org.json.JSONObject
 
-/** Passerelle entre le dashboard (index.html) et le bot. Lecture seule, sauf la Pause. */
+/** Passerelle entre le dashboard (index.html) et le bot. Lecture seule, sauf Pause et Test. */
 class Bridge(private val activity: MainActivity) {
 
     @JavascriptInterface
@@ -24,6 +24,11 @@ class Bridge(private val activity: MainActivity) {
     @JavascriptInterface
     fun setPaused(p: Boolean) {
         Store.paused = p
+    }
+
+    @JavascriptInterface
+    fun postNow() {
+        BotService.instance?.postNow()
     }
 
     @JavascriptInterface
