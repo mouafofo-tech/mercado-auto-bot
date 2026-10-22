@@ -108,6 +108,26 @@ object Store {
         put("convs", trimTo(rest, 30))
     }
 
+    /** Les derniers messages d'une conversation, pour donner le contexte à ChatGPT. */
+    @Synchronized
+    fun history(channel: String, name: String, max: Int = 6): String {
+        val a = arr("convs")
+        for (i in 0 until a.length()) {
+            val o = a.getJSONObject(i)
+            if (o.getString("channel") == channel && o.getString("name") == name) {
+                val m = o.getJSONArray("msgs")
+                val sb = StringBuilder()
+                for (j in maxOf(0, m.length() - max) until m.length()) {
+                    val x = m.getJSONObject(j)
+                    sb.append(if (x.getString("from") == "client") "Client : " else "Moi : ")
+                    sb.append(x.getString("text").replace("\n", " ")).append(" | ")
+                }
+                return sb.toString()
+            }
+        }
+        return ""
+    }
+
     // ---------- apprentissage ----------
     @Synchronized
     fun record(key: String, ok: Boolean) {
