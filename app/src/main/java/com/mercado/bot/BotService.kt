@@ -516,10 +516,17 @@ class BotService : AccessibilityService() {
             tried.add(cand.first)
             click(cand.second)
             val onPage = waitFor(12000) { findText("Buy Sample") != null || findText("Video Gallery") != null }
-            if (onPage && longPressVideo() && clickText(4000, "OK")) {
+            if (onPage) Thread.sleep(2500)
+            val pressed = onPage && longPressVideo()
+            if (pressed && clickText(4000, "OK")) {
                 Thread.sleep(10000)
                 Store.record("cj|save", true)
                 return null
+            }
+            if (round == 0) {
+                val why = if (!onPage) "page produit non reconnue" else if (!pressed) "appui long sans effet" else "bouton OK introuvable"
+                val dd = Store.addTask("Diagnostic CJ : $why", dumpScreen(), "Problème")
+                Store.updateTask(dd, true)
             }
             Store.record("cj|save", false)
             performGlobalAction(GLOBAL_ACTION_BACK)
