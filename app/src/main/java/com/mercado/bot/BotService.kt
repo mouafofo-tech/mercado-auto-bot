@@ -131,18 +131,19 @@ class BotService : AccessibilityService() {
 
         val pkg = e.packageName?.toString() ?: return
         val channel = WATCHED[pkg] ?: return
-        val n = e.parcelableData as? Notification ?: return
-        if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
-        if (n.flags and Notification.FLAG_ONGOING_EVENT != 0) return
-        if (n.extras?.containsKey(Notification.EXTRA_PROGRESS_MAX) == true) return
+        val n = e.parcelableData as? Notification
+        if (n == null) { ignore("notification sans contenu", pkg); return }
+        if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) { ignore("résumé de groupe", pkg); return }
+        if (n.flags and Notification.FLAG_ONGOING_EVENT != 0) { ignore("notification permanente", pkg); return }
+        if (n.extras?.containsKey(Notification.EXTRA_PROGRESS_MAX) == true) { ignore("barre de progression", pkg); return }
         val cat = n.category
         if (cat == Notification.CATEGORY_PROGRESS || cat == Notification.CATEGORY_SERVICE ||
             cat == Notification.CATEGORY_STATUS || cat == Notification.CATEGORY_TRANSPORT
-        ) return
+        ) { ignore("catégorie $cat", pkg); return }
         val title = n.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
         val text = n.extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
-        if (text.isBlank() || title.isBlank()) return
-        if (SYSTEM_WORDS.any { text.contains(it, ignoreCase = true) }) return
+        if (text.isBlank() || title.isBlank()) { ignore("titre ou texte vide", pkg); return }
+        if (SYSTEM_WORDS.any { text.contains(it, ignoreCase = true) }) { ignore("notification système", pkg); return }
 
         val key = "$pkg|$title|$text"
         val now = System.currentTimeMillis()
@@ -150,7 +151,21 @@ class BotService : AccessibilityService() {
         lastKey = key
         lastAt = now
 
-        runJob { handleMessage(pkg, channel, title, text, n) }
+        // Le message est noté tout de suite, même si le bot est occupé ailleurs.
+        val history = Store.history(channel, title)
+        Store.addMessage(channel, title, "client", text)
+        runJob { handleMessage(pkg, channel, title, text, n, history) }
+    }
+
+    private var lastIgnore = 0L
+
+    /** Dit dans le dashboard pourquoi une notification de TikTok / Telegram a été ignorée (1 fois par minute au plus). */
+    private fun ignore(why: String, pkg: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastIgnore < 60000L) return
+        lastIgnore = now
+        val d = Store.addTask("Notification ignorée : $why", pkg, "Diagnostic")
+        Store.updateTask(d, true)
     }
 
     private fun runJob(block: () -> Unit) {
@@ -168,9 +183,22 @@ class BotService : AccessibilityService() {
         }
     }
 
-    /** Appelé par le bouton de test du dashboard. */
+    @Volatile
+    private var draftPending = false
+    private var draftTaskId = 0L
+
+    /** Bouton de test et horaire : le brouillon part dès que le téléphone est libre (une seule demande à la fois). */
     fun postNow() {
-        runJob { postDraft() }
+        if (draftPending || botBusy || !canAct()) return
+        draftTaskId = Store.addTask("Brouillon TikTok", "En attente que le téléphone soit libre", "TikTok")
+        draftPending = true
+    }
+
+    private fun canStartNow(): Boolean {
+        if (Store.paused) return false
+        val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        if (km.isKeyguardLocked) return false
+        return System.currentTimeMillis() - lastUserActivity >= IDLE_MS || overlay != null
     }
 
     // ------------------------------------------------------------------
@@ -225,20 +253,17 @@ class BotService : AccessibilityService() {
     // ------------------------------------------------------------------
     // Réponses aux clients
     // ------------------------------------------------------------------
-    private fun handleMessage(pkg: String, channel: String, title: String, text: String, n: Notification) {
+    private fun handleMessage(pkg: String, channel: String, title: String, text: String, n: Notification, history: String) {
         if (!canAct() || !safePkg(pkg)) return
 
         // Règle : jamais de prix. Le bot attend, c'est toi qui réponds.
         if (Brain.asksPrice(text)) {
-            Store.addMessage(channel, title, "client", text)
             Store.addTask("À toi : $title demande le prix", text.take(90), "À toi")
             return
         }
 
         val tag = if (channel == "tiktok") "TikTok" else "Telegram"
         val taskId = Store.addTask("Répondre à $title", text.take(90), tag)
-        val history = Store.history(channel, title)
-        Store.addMessage(channel, title, "client", text)
 
         try {
             if (!waitForIdle(20 * 60 * 1000L)) {
@@ -348,15 +373,10 @@ class BotService : AccessibilityService() {
     // ------------------------------------------------------------------
     // Brouillon TikTok : intro + vidéo CJ + texte + légende, puis "Drafts"
     // ------------------------------------------------------------------
-    private fun postDraft() {
-        if (!canAct()) return
-        val taskId = Store.addTask("Brouillon TikTok", "En attente que le téléphone soit libre", "TikTok")
+    private fun postDraft(taskId: Long) {
         try {
-            if (!waitForIdle(30 * 60 * 1000L)) {
-                Store.updateTask(taskId, false, "Téléphone utilisé ou verrouillé : abandonné")
-                return
-            }
             botBusy = true
+            holdScreen(getSystemService(Context.POWER_SERVICE) as PowerManager)
             Store.updateTask(taskId, false, "Publication en cours")
             postNote = ""
             val err = saveCjVideo() ?: doPostDraft()
@@ -396,13 +416,11 @@ class BotService : AccessibilityService() {
         val before = draftsCount() ?: 0
 
         // 3. Bouton + puis galerie.
-        val plus = findByRegion(0.42, 0.58, 0.92, 0.99) ?: return postFail("bouton + introuvable")
-        click(plus)
-        if (!waitFor(10000) { findText("Add sound") != null }) return postFail("écran caméra")
+        val plus = findText("Create") ?: findByRegion(0.42, 0.58, 0.92, 0.99) ?: return postFail("bouton + introuvable")
+        if (!clickUntil(plus, 7000) { findText("Add sound") != null }) return postFail("écran caméra")
 
         val thumb = findByRegion(0.03, 0.19, 0.85, 0.93) ?: return postFail("miniature de la galerie")
-        click(thumb)
-        if (!waitFor(8000) { findText("Select multiple") != null || findText("Recents") != null }) {
+        if (!clickUntil(thumb, 7000) { findText("Select multiple") != null || findText("Recents") != null }) {
             return postFail("galerie")
         }
         if (!clickText(4000, "Videos")) return postFail("onglet Videos")
@@ -439,8 +457,7 @@ class BotService : AccessibilityService() {
 
         // 6. Flèche rouge en haut à droite : écran de publication.
         val arrow = findByRegion(0.82, 0.98, 0.03, 0.10) ?: return postFail("flèche suivante")
-        click(arrow)
-        if (!waitFor(25000) { findText("Drafts") != null && findText("Post") != null }) {
+        if (!clickUntil(arrow, 12000) { findText("Drafts") != null && findText("Post") != null }) {
             return postFail("écran de publication")
         }
 
@@ -457,7 +474,12 @@ class BotService : AccessibilityService() {
         // 8. Drafts, jamais Post.
         val drafts = findText("Drafts") ?: return postFail("bouton Drafts")
         if (!clickNarrow(drafts, 0.7)) return postFail("clic sur Drafts")
-        Thread.sleep(6000)
+        Thread.sleep(5000)
+        if (findText("Drafts") != null && findText("Post") != null) {
+            val d2 = findText("Drafts")
+            if (d2 != null) tapNode(d2)
+            Thread.sleep(4000)
+        }
 
         // 9. Vérification : le nombre de brouillons doit avoir augmenté.
         if (!goProfile(pkg)) return postFail("retour au profil")
@@ -575,6 +597,41 @@ class BotService : AccessibilityService() {
         }
     }
 
+    /** Touche l'écran à cet endroit avec un vrai geste (quand le clic d'accessibilité ne marche pas). */
+    private fun tapAt(x: Float, y: Float) {
+        if (Store.paused) throw PauseStop()
+        val path = Path()
+        path.moveTo(x, y)
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 80L)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        val latch = CountDownLatch(1)
+        overlayBlocksTouches(false)
+        try {
+            Thread.sleep(300)
+            val sent = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) { latch.countDown() }
+                override fun onCancelled(gestureDescription: GestureDescription?) { latch.countDown() }
+            }, null)
+            if (sent) latch.await(3, TimeUnit.SECONDS)
+        } finally {
+            overlayBlocksTouches(true)
+        }
+    }
+
+    private fun tapNode(n: AccessibilityNodeInfo) {
+        val b = Rect()
+        n.getBoundsInScreen(b)
+        tapAt(b.centerX().toFloat(), b.centerY().toFloat())
+    }
+
+    /** Clic d'accessibilité, puis si rien ne change : vrai toucher au même endroit. */
+    private fun clickUntil(node: AccessibilityNodeInfo, ms: Long, cond: () -> Boolean): Boolean {
+        click(node)
+        if (waitFor(ms, cond)) return true
+        tapNode(node)
+        return waitFor(ms, cond)
+    }
+
     private fun cjFail(step: String): String {
         val d = Store.addTask("Diagnostic CJ : $step", dumpScreen(), "Problème")
         Store.updateTask(d, true)
@@ -593,9 +650,19 @@ class BotService : AccessibilityService() {
     @Volatile
     private var emergencyUntil = 0L
 
+    private var lastTickError = 0L
+
     private val ticker = object : Runnable {
         override fun run() {
-            try { tick() } catch (t: Throwable) { }
+            try {
+                tick()
+            } catch (t: Throwable) {
+                val now = System.currentTimeMillis()
+                if (now - lastTickError > 10 * 60 * 1000L) {
+                    lastTickError = now
+                    Store.addTask("Problème couverture", t.message ?: t.javaClass.simpleName, "Problème")
+                }
+            }
             main.postDelayed(this, 5000)
         }
     }
@@ -619,6 +686,15 @@ class BotService : AccessibilityService() {
         if (want && overlay == null) showOverlay()
         if (!want && overlay != null) hideOverlay()
         overlayStatus?.text = statusText()
+        if (draftPending && Store.paused) {
+            draftPending = false
+            Store.updateTask(draftTaskId, false, "Annulé : Pause activée")
+        }
+        if (draftPending && !botBusy && canStartNow()) {
+            draftPending = false
+            val id = draftTaskId
+            runJob { postDraft(id) }
+        }
         if (inWindow && !Store.paused) startDailyDraft()
     }
 
