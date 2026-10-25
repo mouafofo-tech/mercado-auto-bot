@@ -430,10 +430,14 @@ class BotService : AccessibilityService() {
         Thread.sleep(800)
 
         // 4. L'intro (4 secondes) d'abord, puis la vidéo CJ la plus récente.
-        val intro = durationTiles().firstOrNull { it.first == "00:04" }
-            ?: return postFail("intro de 4 secondes introuvable")
-        click(intro.second)
+        val intro = findIntroTile() ?: return postFail("intro de 4 secondes introuvable")
+        click(intro)
         Thread.sleep(900)
+        for (i in 0 until 15) {
+            if (!scrollGallery(false)) break
+            Thread.sleep(600)
+        }
+        Thread.sleep(800)
         val cj = durationTiles().firstOrNull { it.first != "00:04" }
             ?: return postFail("vidéo CJ introuvable")
         click(cj.second)
@@ -873,6 +877,64 @@ class BotService : AccessibilityService() {
         )
     }
 
+    private fun gallerySignature(): String =
+        durationTiles().joinToString(",") { it.first + "@" + centerOf(it.second).second }
+
+    /** Glisse le doigt sur l'écran (vrai geste), pour faire défiler une liste qui ignore l'accessibilité. */
+    private fun swipe(x1: Float, y1: Float, x2: Float, y2: Float) {
+        if (Store.paused) throw PauseStop()
+        val path = Path()
+        path.moveTo(x1, y1)
+        path.lineTo(x2, y2)
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 400L)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        val latch = CountDownLatch(1)
+        overlayBlocksTouches(false)
+        try {
+            Thread.sleep(300)
+            val sent = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) { latch.countDown() }
+                override fun onCancelled(gestureDescription: GestureDescription?) { latch.countDown() }
+            }, null)
+            if (sent) latch.await(3, TimeUnit.SECONDS)
+        } finally {
+            overlayBlocksTouches(true)
+        }
+    }
+
+    /** Fait défiler la galerie (vers le bas si forward, vers le haut sinon). Retourne false si plus rien ne bouge. */
+    private fun scrollGallery(forward: Boolean): Boolean {
+        val before = gallerySignature()
+        val grid = allNodes()
+            .filter { it.isScrollable && it.isVisibleToUser }
+            .maxByOrNull { val b = Rect(); it.getBoundsInScreen(b); b.width().toLong() * b.height().toLong() }
+        if (grid != null) {
+            val action = if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+            grid.performAction(action)
+            Thread.sleep(900)
+            if (gallerySignature() != before) return true
+        }
+        // Sinon : un vrai glissement du doigt au milieu de l'écran.
+        val dm = resources.displayMetrics
+        val x = dm.widthPixels * 0.5f
+        val hi = dm.heightPixels * 0.72f
+        val lo = dm.heightPixels * 0.38f
+        if (forward) swipe(x, hi, x, lo) else swipe(x, lo, x, hi)
+        Thread.sleep(900)
+        return gallerySignature() != before
+    }
+
+    /** Cherche l'intro de 4 secondes, en faisant défiler la galerie vers le bas si besoin. */
+    private fun findIntroTile(): AccessibilityNodeInfo? {
+        for (i in 0 until 15) {
+            val t = durationTiles().firstOrNull { it.first == "00:04" }
+            if (t != null) return t.second
+            if (!scrollGallery(true)) return null
+            Thread.sleep(1000)
+        }
+        return null
+    }
+
     private fun centerOf(n: AccessibilityNodeInfo): Pair<Int, Int> {
         val b = Rect()
         n.getBoundsInScreen(b)
@@ -1050,7 +1112,7 @@ class BotService : AccessibilityService() {
     /** Liste les boutons visibles, pour comprendre pourquoi l'envoi a échoué. */
     private fun dumpClickables(): String =
         allNodes()
-            .filter { it.isClickable && it.isVisibleToUser }
+            .filter { (it.isClickable || it.contentDescription != null) && it.isVisibleToUser }
             .joinToString(" | ") { n ->
                 val b = Rect()
                 n.getBoundsInScreen(b)
@@ -1059,20 +1121,31 @@ class BotService : AccessibilityService() {
             }
             .take(900)
 
+    private fun inputCleared(): Boolean {
+        val e = findEditable()
+        return e == null || e.isShowingHintText || e.text.isNullOrEmpty()
+    }
+
     /** Essaie plusieurs façons d'appuyer sur Envoyer, la plus réussie d'abord (apprentissage). */
     private fun pressSend(pkg: String): Boolean {
         val order = listOf("desc", "text", "id", "has", "right", "ime")
             .sortedByDescending { Store.score("$pkg|send|$it") }
         for (t in order) {
             if (Store.paused) return false
-            val tried = trySend(t)
+            val target = if (t == "ime") null else sendTarget(t)
+            val tried = if (t == "ime") trySendIme() else (target != null && click(target))
             if (!tried) {
                 Store.record("$pkg|send|$t", false)
                 continue
             }
             Thread.sleep(1500)
-            val e = findEditable()
-            val cleared = e == null || e.isShowingHintText || e.text.isNullOrEmpty()
+            var cleared = inputCleared()
+            // ChatGPT ignore parfois le clic d'accessibilité : on touche alors le bouton pour de vrai.
+            if (!cleared && target != null && pkg == CHATGPT) {
+                tapNode(target)
+                Thread.sleep(1500)
+                cleared = inputCleared()
+            }
             Store.record("$pkg|send|$t", cleared)
             if (cleared) return true
         }
@@ -1081,13 +1154,13 @@ class BotService : AccessibilityService() {
         return false
     }
 
-    private fun trySend(tactic: String): Boolean {
+    private fun trySendIme(): Boolean =
+        Build.VERSION.SDK_INT >= 30 &&
+            findEditable()?.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id) == true
+
+    private fun sendTarget(tactic: String): AccessibilityNodeInfo? {
         val nodes = allNodes()
-        if (tactic == "ime") {
-            return Build.VERSION.SDK_INT >= 30 &&
-                findEditable()?.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id) == true
-        }
-        val target: AccessibilityNodeInfo? = when (tactic) {
+        return when (tactic) {
             "desc" -> nodes.firstOrNull { n ->
                 val d = n.contentDescription?.toString()?.trim()?.lowercase()
                 d != null && SEND_WORDS.contains(d)
@@ -1104,7 +1177,6 @@ class BotService : AccessibilityService() {
             "right" -> findEditable()?.let { rightOf(it, nodes) }
             else -> null
         }
-        return target != null && click(target)
     }
 
     private fun rightOf(e: AccessibilityNodeInfo, nodes: List<AccessibilityNodeInfo>): AccessibilityNodeInfo? {
